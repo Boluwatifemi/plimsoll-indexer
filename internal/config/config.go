@@ -74,6 +74,7 @@ type Config struct {
 	// idle services (Render's free tier) keeps this one, and its poster, up.
 	KeepAwakeURL      string
 	KeepAwakeInterval time.Duration
+	ShutdownTimeout   time.Duration
 
 	// MaxFeeStroops is the absolute ceiling the invoker will sign per
 	// transaction. Zero means no ceiling.
@@ -155,6 +156,7 @@ func Load() (Config, error) {
 		{"REPOST_AFTER", "6h", &c.RepostAfter},
 		{"TOML_INTERVAL", "6h", &c.TomlInterval},
 		{"KEEP_AWAKE_INTERVAL", "10m", &c.KeepAwakeInterval},
+		{"SHUTDOWN_TIMEOUT", "30s", &c.ShutdownTimeout},
 	}
 	for _, d := range durations {
 		v, err := time.ParseDuration(envOr(d.name, d.def))

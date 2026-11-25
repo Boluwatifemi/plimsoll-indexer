@@ -157,6 +157,9 @@ func TestLoadDefaults(t *testing.T) {
 	if got.KeepAwakeInterval.String() != "10m0s" {
 		t.Errorf("KeepAwakeInterval = %v, want 10m0s", got.KeepAwakeInterval)
 	}
+	if got.ShutdownTimeout.String() != "30s" {
+		t.Errorf("ShutdownTimeout = %v, want 30s", got.ShutdownTimeout)
+	}
 }
 
 // TestLoadRequiredMissing checks that each required variable produces an error

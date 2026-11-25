@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,6 +53,7 @@ func main() {
 func run(cfg config.Config, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	jobs := &jobGroup{}
 
 	db, err := store.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -82,7 +86,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 	if err := ingester.Run(ctx); err != nil {
 		log.Error("initial ingest failed", "err", err)
 	}
-	go every(ctx, cfg.IngestInterval, log.With("job", "ingest"), ingester.Run)
+	jobs.startEvery(ctx, "ingest", cfg.IngestInterval, log.With("job", "ingest"), ingester.Run)
 
 	// Repairs what an ingestion gap lost by reading contract state back.
 	// Reading is simulation, so this needs no key and runs even on an instance
@@ -96,7 +100,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 	if err := reconciler.Run(ctx); err != nil {
 		log.Error("initial reconcile failed", "err", err)
 	}
-	go every(ctx, cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
+	jobs.startEvery(ctx, "reconcile", cfg.ReconcileInterval, log.With("job", "reconcile"), reconciler.Run)
 
 	tomlSync := &worker.TomlSync{
 		Horizon:  hz,
@@ -107,21 +111,22 @@ func run(cfg config.Config, log *slog.Logger) error {
 		Log:      log.With("job", "toml"),
 	}
 	// Checks every minute; each asset is refreshed once per TOML_INTERVAL.
-	go every(ctx, time.Minute, log.With("job", "toml"), tomlSync.Run)
+	jobs.startEvery(ctx, "toml", time.Minute, log.With("job", "toml"), tomlSync.Run)
 
 	if cfg.KeepAwakeURL != "" {
 		keepAwake := worker.NewKeepAwake(cfg.KeepAwakeURL)
 		kaLog := log.With("job", "keepawake")
 		kaLog.Info("keep-awake enabled", "url", cfg.KeepAwakeURL, "interval", cfg.KeepAwakeInterval)
-		go func() {
+		jobs.start(ctx, "keepawake", func(ctx context.Context) error {
 			// Wait one interval first: the HTTP server is not listening yet.
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			case <-time.After(cfg.KeepAwakeInterval):
 			}
-			every(ctx, cfg.KeepAwakeInterval, kaLog, keepAwake.Run)
-		}()
+			everyTracked(jobs, ctx, "keepawake", cfg.KeepAwakeInterval, kaLog, keepAwake.Run)
+			return nil
+		})
 	}
 
 	if cfg.PostingEnabled() {
@@ -153,7 +158,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 			log.Info("supply cross-check disabled (HORIZON_CHECK_URL not set)")
 		}
 		log.Info("supply posting enabled", "poster", signer.Address())
-		go every(ctx, cfg.PostInterval, log.With("job", "poster"), poster.Run)
+		jobs.startEvery(ctx, "poster", cfg.PostInterval, log.With("job", "poster"), poster.Run)
 
 	} else {
 		log.Info("supply posting disabled (SUPPLY_POSTER_SECRET not set)")
@@ -179,25 +184,83 @@ func run(cfg config.Config, log *slog.Logger) error {
 		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	var shutdownDeadline atomic.Int64
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownDeadline.Store(time.Now().Add(cfg.ShutdownTimeout).UnixNano())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 	log.Info("listening", "addr", srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		stop()
+		jobs.wait(shutdownRemaining(shutdownDeadline.Load(), cfg.ShutdownTimeout), log)
 		return err
 	}
+	stop()
+	jobs.wait(shutdownRemaining(shutdownDeadline.Load(), cfg.ShutdownTimeout), log)
 	return nil
 }
 
-// every runs fn immediately, then on each tick, until ctx is done.
-func every(ctx context.Context, interval time.Duration, log *slog.Logger, fn func(context.Context) error) {
+func shutdownRemaining(deadlineUnixNano int64, fallback time.Duration) time.Duration {
+	if deadlineUnixNano == 0 {
+		return fallback
+	}
+	return time.Until(time.Unix(0, deadlineUnixNano))
+}
+
+type jobGroup struct {
+	mu       sync.Mutex
+	running  map[string]bool
+	active   int
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+func (g *jobGroup) start(ctx context.Context, name string, fn func(context.Context) error) {
+	g.mu.Lock()
+	if g.running == nil {
+		g.running = make(map[string]bool)
+		g.done = make(chan struct{})
+	}
+	g.active++
+	g.mu.Unlock()
+
+	go func() {
+		defer func() {
+			g.mu.Lock()
+			delete(g.running, name)
+			g.active--
+			done := g.done
+			finished := g.active == 0
+			g.mu.Unlock()
+			if finished {
+				g.doneOnce.Do(func() { close(done) })
+			}
+		}()
+		g.mu.Lock()
+		g.running[name] = true
+		g.mu.Unlock()
+		_ = fn(ctx)
+	}()
+}
+
+func (g *jobGroup) startEvery(ctx context.Context, name string, interval time.Duration, log *slog.Logger, fn func(context.Context) error) {
+	g.start(ctx, name, func(ctx context.Context) error {
+		everyTracked(g, ctx, name, interval, log, fn)
+		return nil
+	})
+}
+
+func everyTracked(g *jobGroup, ctx context.Context, name string, interval time.Duration, log *slog.Logger, fn func(context.Context) error) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		if err := fn(ctx); err != nil && ctx.Err() == nil {
+		g.begin(name)
+		err := fn(ctx)
+		g.end(name)
+		if err != nil && ctx.Err() == nil {
 			log.Error("job failed", "err", err)
 		}
 		select {
@@ -205,6 +268,42 @@ func every(ctx context.Context, interval time.Duration, log *slog.Logger, fn fun
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+func (g *jobGroup) begin(name string) {
+	g.mu.Lock()
+	g.running[name] = true
+	g.mu.Unlock()
+}
+
+func (g *jobGroup) end(name string) {
+	g.mu.Lock()
+	delete(g.running, name)
+	g.mu.Unlock()
+}
+
+func (g *jobGroup) wait(timeout time.Duration, log *slog.Logger) {
+	g.mu.Lock()
+	done := g.done
+	g.mu.Unlock()
+	if done == nil {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+		g.mu.Lock()
+		names := make([]string, 0, len(g.running))
+		for name := range g.running {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		g.mu.Unlock()
+		log.Error("shutdown deadline reached with jobs still running", "running_jobs", strings.Join(names, ","))
 	}
 }
 
